@@ -1,8 +1,9 @@
 from pathlib import Path
+import html
 
+import gradio as gr
 import joblib
 import pandas as pd
-import streamlit as st
 
 
 # =========================================================
@@ -19,7 +20,7 @@ VIDEO_PATH = BASE_DIR / "Axial Deformation.mp4"
 
 # =========================================================
 # MODEL INPUT COLUMNS
-# These names must exactly match the columns used in training.
+# These names must match the columns used during training.
 # =========================================================
 FEATURE_COLS = [
     "E Fixed",
@@ -30,94 +31,19 @@ FEATURE_COLS = [
     "nu Free",
 ]
 
-TARGET_COL = "Axial Frequency (Hz)"
-
-
-# =========================================================
-# STREAMLIT PAGE SETTINGS
-# =========================================================
-st.set_page_config(
-    page_title="Axial Frequency Predictor",
-    page_icon="⚙️",
-    layout="wide",
-)
-
-
-# =========================================================
-# CUSTOM STYLE
-# =========================================================
-st.markdown(
-    """
-    <style>
-    .main-title {
-        font-size: 2.4rem;
-        font-weight: 800;
-        margin-bottom: 0.25rem;
-    }
-
-    .subtitle {
-        font-size: 1rem;
-        color: #9ca3af;
-        margin-bottom: 1.5rem;
-    }
-
-    .prediction-card {
-        background: linear-gradient(135deg, #0f5132, #198754);
-        border-radius: 16px;
-        padding: 28px;
-        margin-top: 12px;
-        margin-bottom: 18px;
-        box-shadow: 0 5px 18px rgba(0, 0, 0, 0.25);
-    }
-
-    .prediction-label {
-        font-size: 1.15rem;
-        font-weight: 650;
-        color: #d9fbe5;
-        margin-bottom: 12px;
-    }
-
-    .prediction-value {
-        font-size: 2.8rem;
-        font-weight: 850;
-        color: #ffffff;
-        line-height: 1.1;
-    }
-
-    .prediction-unit {
-        font-size: 1.15rem;
-        font-weight: 600;
-        color: #d9fbe5;
-        margin-left: 6px;
-    }
-
-    .info-box {
-        background: rgba(59, 130, 246, 0.10);
-        border: 1px solid rgba(59, 130, 246, 0.30);
-        border-radius: 12px;
-        padding: 14px 16px;
-        margin-top: 10px;
-        margin-bottom: 14px;
-    }
-
-    .warning-box {
-        background: rgba(245, 158, 11, 0.12);
-        border: 1px solid rgba(245, 158, 11, 0.35);
-        border-radius: 12px;
-        padding: 14px 16px;
-        color: #facc15;
-        margin-top: 10px;
-        margin-bottom: 14px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+DISPLAY_NAMES = {
+    "E Fixed": "E (Fixed) [N/m²]",
+    "rho Fixed": "ρ (Fixed) [kg/m³]",
+    "nu Fixed": "ν (Fixed) [-]",
+    "E Free": "E (Free) [N/m²]",
+    "rho Free": "ρ (Free) [kg/m³]",
+    "nu Free": "ν (Free) [-]",
+}
 
 
 # =========================================================
 # COLUMN NORMALIZATION
-# Used only for the optional Excel validity table.
+# This is used only for the optional validity-range table.
 # =========================================================
 def simplify_name(name: str) -> str:
     text = str(name).strip().lower()
@@ -144,11 +70,15 @@ def simplify_name(name: str) -> str:
     return text
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(column).strip() for column in df.columns]
+def normalize_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+    dataframe = dataframe.copy()
 
-    canonical_targets = {
+    dataframe.columns = [
+        str(column).strip()
+        for column in dataframe.columns
+    ]
+
+    canonical_names = {
         "efixed": "E Fixed",
         "rhofixed": "rho Fixed",
         "nufixed": "nu Fixed",
@@ -159,279 +89,240 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "axialfrequency": "Axial Frequency (Hz)",
     }
 
-    rename_dict = {}
+    rename_dictionary = {}
 
-    for original_column in df.columns:
+    for original_column in dataframe.columns:
         simplified_column = simplify_name(original_column)
 
-        if simplified_column in canonical_targets:
-            rename_dict[original_column] = canonical_targets[
-                simplified_column
-            ]
+        if simplified_column in canonical_names:
+            rename_dictionary[original_column] = (
+                canonical_names[simplified_column]
+            )
 
-    return df.rename(columns=rename_dict)
+    return dataframe.rename(columns=rename_dictionary)
 
 
 # =========================================================
-# LOAD MODEL
+# LOAD SAVED MODEL
+# The application remains visible even if model loading fails.
 # =========================================================
-@st.cache_resource
-def load_model():
+MODEL = None
+MODEL_ERROR = None
+
+try:
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Model file was not found: {MODEL_PATH.name}"
+            f"{MODEL_PATH.name} was not found."
         )
 
-    return joblib.load(MODEL_PATH)
+    MODEL = joblib.load(MODEL_PATH)
+
+except Exception as error:
+    MODEL_ERROR = str(error)
 
 
 # =========================================================
-# LOAD OPTIONAL DATASET
+# LOAD OPTIONAL REFERENCE DATASET
 # =========================================================
-@st.cache_data
-def load_reference_dataset():
-    if not DATA_PATH.exists():
-        return None
+REFERENCE_DATA = None
+DATA_ERROR = None
 
-    df = pd.read_excel(DATA_PATH)
-    df = normalize_columns(df)
+try:
+    if DATA_PATH.exists():
+        reference_data = pd.read_excel(DATA_PATH)
+        reference_data = normalize_columns(reference_data)
 
-    missing_columns = [
-        column
-        for column in FEATURE_COLS
-        if column not in df.columns
-    ]
+        missing_columns = [
+            column
+            for column in FEATURE_COLS
+            if column not in reference_data.columns
+        ]
 
-    if missing_columns:
-        return None
+        if missing_columns:
+            raise ValueError(
+                "The following input columns are missing "
+                f"from Raw_Data_Set.xlsx: {missing_columns}"
+            )
 
-    reference_df = df[FEATURE_COLS].copy()
+        reference_data = reference_data[FEATURE_COLS].copy()
 
-    for column in FEATURE_COLS:
-        reference_df[column] = pd.to_numeric(
-            reference_df[column],
-            errors="coerce",
+        for column in FEATURE_COLS:
+            reference_data[column] = pd.to_numeric(
+                reference_data[column],
+                errors="coerce",
+            )
+
+        REFERENCE_DATA = (
+            reference_data
+            .dropna(how="all")
+            .reset_index(drop=True)
         )
 
-    return reference_df.dropna(how="all").reset_index(drop=True)
+except Exception as error:
+    DATA_ERROR = str(error)
 
 
 # =========================================================
 # INPUT DATAFRAME
 # =========================================================
 def create_input_dataframe(
-    e_fixed: float,
-    rho_fixed: float,
-    nu_fixed: float,
-    e_free: float,
-    rho_free: float,
-    nu_free: float,
+    e_fixed,
+    rho_fixed,
+    nu_fixed,
+    e_free,
+    rho_free,
+    nu_free,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "E Fixed": e_fixed,
-                "rho Fixed": rho_fixed,
-                "nu Fixed": nu_fixed,
-                "E Free": e_free,
-                "rho Free": rho_free,
-                "nu Free": nu_free,
+                "E Fixed": float(e_fixed),
+                "rho Fixed": float(rho_fixed),
+                "nu Fixed": float(nu_fixed),
+                "E Free": float(e_free),
+                "rho Free": float(rho_free),
+                "nu Free": float(nu_free),
             }
         ]
     )
 
 
 # =========================================================
-# VALIDITY-RANGE TABLE
-# =========================================================
-def build_validity_table(
-    input_df: pd.DataFrame,
-    reference_df: pd.DataFrame,
-) -> pd.DataFrame:
-    display_names = {
-        "E Fixed": "E (Fixed) [N/m²]",
-        "rho Fixed": "ρ (Fixed) [kg/m³]",
-        "nu Fixed": "ν (Fixed) [-]",
-        "E Free": "E (Free) [N/m²]",
-        "rho Free": "ρ (Free) [kg/m³]",
-        "nu Free": "ν (Free) [-]",
-    }
-
-    rows = []
-    input_values = input_df.iloc[0]
-
-    for feature in FEATURE_COLS:
-        current_value = float(input_values[feature])
-        minimum_value = float(reference_df[feature].min())
-        maximum_value = float(reference_df[feature].max())
-
-        status = (
-            "Inside"
-            if minimum_value <= current_value <= maximum_value
-            else "Outside"
-        )
-
-        rows.append(
-            {
-                "Feature": display_names.get(feature, feature),
-                "Current Value": f"{current_value:.6e}",
-                "Training Minimum": f"{minimum_value:.6e}",
-                "Training Maximum": f"{maximum_value:.6e}",
-                "Status": status,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-# =========================================================
 # INPUT VALIDATION
 # =========================================================
 def validate_inputs(
-    e_fixed: float,
-    rho_fixed: float,
-    nu_fixed: float,
-    e_free: float,
-    rho_free: float,
-    nu_free: float,
-):
-    if e_fixed <= 0:
+    e_fixed,
+    rho_fixed,
+    nu_fixed,
+    e_free,
+    rho_free,
+    nu_free,
+) -> None:
+    values = [
+        e_fixed,
+        rho_fixed,
+        nu_fixed,
+        e_free,
+        rho_free,
+        nu_free,
+    ]
+
+    if any(value is None for value in values):
+        raise ValueError(
+            "Please enter all six material properties."
+        )
+
+    if float(e_fixed) <= 0:
         raise ValueError(
             "E (Fixed) must be greater than zero."
         )
 
-    if rho_fixed <= 0:
+    if float(rho_fixed) <= 0:
         raise ValueError(
             "ρ (Fixed) must be greater than zero."
         )
 
-    if e_free <= 0:
+    if float(e_free) <= 0:
         raise ValueError(
             "E (Free) must be greater than zero."
         )
 
-    if rho_free <= 0:
+    if float(rho_free) <= 0:
         raise ValueError(
             "ρ (Free) must be greater than zero."
         )
 
-    if not 0 <= nu_fixed < 0.5:
+    if not 0 <= float(nu_fixed) < 0.5:
         raise ValueError(
             "ν (Fixed) must be between 0 and 0.5."
         )
 
-    if not 0 <= nu_free < 0.5:
+    if not 0 <= float(nu_free) < 0.5:
         raise ValueError(
             "ν (Free) must be between 0 and 0.5."
         )
 
 
 # =========================================================
-# PAGE HEADER
+# VALIDITY TABLE
 # =========================================================
-st.markdown(
-    '<div class="main-title">Axial Frequency Predictor</div>',
-    unsafe_allow_html=True,
-)
+def build_validity_table(
+    input_dataframe: pd.DataFrame,
+) -> tuple[pd.DataFrame, int]:
+    rows = []
+    outside_count = 0
 
-st.markdown(
-    """
-    <div class="subtitle">
-    Predict axial frequency using a trained ExtraTrees regression model.
-    Enter the material properties for the fixed and free sections.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+    for feature in FEATURE_COLS:
+        current_value = float(
+            input_dataframe.iloc[0][feature]
+        )
 
+        if (
+            REFERENCE_DATA is not None
+            and not REFERENCE_DATA.empty
+        ):
+            minimum_value = float(
+                REFERENCE_DATA[feature].min()
+            )
 
-# =========================================================
-# OPTIONAL IMAGE
-# =========================================================
-if IMAGE_PATH.exists():
-    st.image(
-        str(IMAGE_PATH),
-        use_container_width=True,
-    )
+            maximum_value = float(
+                REFERENCE_DATA[feature].max()
+            )
 
+            inside_range = (
+                minimum_value
+                <= current_value
+                <= maximum_value
+            )
 
-# =========================================================
-# SIDEBAR INPUTS
-# =========================================================
-with st.sidebar:
-    st.header("Input Material Properties")
+            status = (
+                "Inside"
+                if inside_range
+                else "Outside"
+            )
 
-    st.caption(
-        "Use SI units: E in N/m², ρ in kg/m³, "
-        "and ν is dimensionless."
-    )
+            if not inside_range:
+                outside_count += 1
 
-    st.subheader("Fixed Material")
+            minimum_display = f"{minimum_value:.6e}"
+            maximum_display = f"{maximum_value:.6e}"
 
-    e_fixed = st.number_input(
-        "E (Fixed) [N/m²]",
-        min_value=0.0,
-        value=1.97e11,
-        step=1e8,
-        format="%.6e",
-    )
+        else:
+            status = "Not checked"
+            minimum_display = "N/A"
+            maximum_display = "N/A"
 
-    rho_fixed = st.number_input(
-        "ρ (Fixed) [kg/m³]",
-        min_value=0.0,
-        value=7750.3,
-        step=1.0,
-        format="%.6f",
-    )
+        rows.append(
+            {
+                "Feature": DISPLAY_NAMES[feature],
+                "Current Value": f"{current_value:.6e}",
+                "Training Minimum": minimum_display,
+                "Training Maximum": maximum_display,
+                "Status": status,
+            }
+        )
 
-    nu_fixed = st.number_input(
-        "ν (Fixed) [-]",
-        min_value=0.0,
-        max_value=0.4999,
-        value=0.29,
-        step=0.001,
-        format="%.6f",
-    )
-
-    st.subheader("Free Material")
-
-    e_free = st.number_input(
-        "E (Free) [N/m²]",
-        min_value=0.0,
-        value=4.24e8,
-        step=1e8,
-        format="%.6e",
-    )
-
-    rho_free = st.number_input(
-        "ρ (Free) [kg/m³]",
-        min_value=0.0,
-        value=2200.5,
-        step=1.0,
-        format="%.6f",
-    )
-
-    nu_free = st.number_input(
-        "ν (Free) [-]",
-        min_value=0.0,
-        max_value=0.4999,
-        value=0.45,
-        step=0.001,
-        format="%.6f",
-    )
-
-    predict_button = st.button(
-        "Predict Axial Frequency",
-        use_container_width=True,
-        type="primary",
-    )
+    return pd.DataFrame(rows), outside_count
 
 
 # =========================================================
-# PREDICTION
+# PREDICTION FUNCTION
 # =========================================================
-if predict_button:
+def predict_axial_frequency(
+    e_fixed,
+    rho_fixed,
+    nu_fixed,
+    e_free,
+    rho_free,
+    nu_free,
+):
     try:
+        if MODEL is None:
+            raise RuntimeError(
+                "The saved model could not be loaded. "
+                f"Details: {MODEL_ERROR}"
+            )
+
         validate_inputs(
             e_fixed=e_fixed,
             rho_fixed=rho_fixed,
@@ -441,9 +332,7 @@ if predict_button:
             nu_free=nu_free,
         )
 
-        model = load_model()
-
-        input_df = create_input_dataframe(
+        input_dataframe = create_input_dataframe(
             e_fixed=e_fixed,
             rho_fixed=rho_fixed,
             nu_fixed=nu_fixed,
@@ -453,113 +342,285 @@ if predict_button:
         )
 
         prediction = float(
-            model.predict(
-                input_df[FEATURE_COLS]
+            MODEL.predict(
+                input_dataframe[FEATURE_COLS]
             )[0]
         )
 
-        st.subheader("Prediction Result")
+        validity_table, outside_count = (
+            build_validity_table(input_dataframe)
+        )
 
-        st.markdown(
-            f"""
-            <div class="prediction-card">
-                <div class="prediction-label">
-                    Predicted Axial Frequency
-                </div>
-
-                <div class="prediction-value">
-                    {prediction:,.2f}
-                    <span class="prediction-unit">Hz</span>
-                </div>
+        result_html = f"""
+        <div class="prediction-card">
+            <div class="prediction-title">
+                Predicted Axial Frequency
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
-        st.subheader("Input Summary")
+            <div class="prediction-number">
+                {prediction:,.2f}
+                <span class="prediction-unit">Hz</span>
+            </div>
 
-        summary_df = pd.DataFrame(
-            {
-                "Property": [
-                    "E (Fixed)",
-                    "ρ (Fixed)",
-                    "ν (Fixed)",
-                    "E (Free)",
-                    "ρ (Free)",
-                    "ν (Free)",
-                ],
-                "Value": [
-                    f"{e_fixed:.6e} N/m²",
-                    f"{rho_fixed:.6f} kg/m³",
-                    f"{nu_fixed:.6f}",
-                    f"{e_free:.6e} N/m²",
-                    f"{rho_free:.6f} kg/m³",
-                    f"{nu_free:.6f}",
-                ],
-            }
-        )
+            <div class="prediction-model">
+                Prediction model: ExtraTrees Regressor
+            </div>
+        </div>
+        """
 
-        st.dataframe(
-            summary_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        reference_df = load_reference_dataset()
-
-        if reference_df is not None and not reference_df.empty:
-            validity_df = build_validity_table(
-                input_df=input_df,
-                reference_df=reference_df,
-            )
-
-            outside_count = int(
-                (validity_df["Status"] == "Outside").sum()
-            )
-
-            if outside_count > 0:
-                st.markdown(
-                    """
-                    <div class="warning-box">
-                    Warning: One or more values are outside the
-                    model-training range. The prediction involves
-                    extrapolation and may be less reliable.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+        if REFERENCE_DATA is None:
+            if DATA_ERROR:
+                status_message = (
+                    "ℹ️ Prediction completed. The training-range "
+                    f"check was unavailable: `{DATA_ERROR}`"
                 )
             else:
-                st.success(
-                    "All input values are inside the training-data range."
+                status_message = (
+                    "ℹ️ Prediction completed. "
+                    "`Raw_Data_Set.xlsx` was not included, "
+                    "so the training-range check was skipped."
                 )
 
-            with st.expander(
-                "Show training validity-region table"
-            ):
-                st.dataframe(
-                    validity_df,
-                    use_container_width=True,
-                    hide_index=True,
-                )
+        elif outside_count > 0:
+            status_message = (
+                f"⚠️ **Warning:** {outside_count} input value(s) "
+                "are outside the training-data range. "
+                "This prediction involves extrapolation and "
+                "may be less reliable."
+            )
 
-        if VIDEO_PATH.exists():
-            st.subheader("Axial Deformation")
-            st.video(str(VIDEO_PATH))
+        else:
+            status_message = (
+                "✅ All input values are inside the "
+                "training-data range."
+            )
+
+        return (
+            result_html,
+            status_message,
+            validity_table,
+        )
 
     except Exception as error:
-        st.error(f"Prediction error: {error}")
+        escaped_error = html.escape(str(error))
 
+        error_html = f"""
+        <div class="error-card">
+            <div class="error-title">
+                Prediction could not be completed
+            </div>
 
-# =========================================================
-# INITIAL INFORMATION
-# =========================================================
-else:
-    st.markdown(
-        """
-        <div class="info-box">
-        Enter the six material properties in the sidebar and
-        select <strong>Predict Axial Frequency</strong>.
+            <div class="error-message">
+                {escaped_error}
+            </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
+
+        empty_table = pd.DataFrame(
+            columns=[
+                "Feature",
+                "Current Value",
+                "Training Minimum",
+                "Training Maximum",
+                "Status",
+            ]
+        )
+
+        return (
+            error_html,
+            "Please correct the inputs or check the Space logs.",
+            empty_table,
+        )
+
+
+# =========================================================
+# CUSTOM CSS
+# =========================================================
+CUSTOM_CSS = """
+.gradio-container {
+    max-width: 1200px !important;
+    margin: auto !important;
+}
+
+.app-subtitle {
+    color: #6b7280;
+    font-size: 1.05rem;
+    margin-bottom: 1.25rem;
+}
+
+.prediction-card {
+    background: linear-gradient(135deg, #0f5132, #198754);
+    border-radius: 18px;
+    padding: 30px;
+    margin-top: 15px;
+    margin-bottom: 18px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+}
+
+.prediction-title {
+    color: #d9fbe5;
+    font-size: 1.3rem;
+    font-weight: 700;
+    margin-bottom: 14px;
+}
+
+.prediction-number {
+    color: white;
+    font-size: 3rem;
+    font-weight: 850;
+    line-height: 1.1;
+}
+
+.prediction-unit {
+    color: #d9fbe5;
+    font-size: 1.3rem;
+    font-weight: 650;
+}
+
+.prediction-model {
+    color: #d9fbe5;
+    margin-top: 14px;
+    font-size: 0.95rem;
+}
+
+.error-card {
+    background: rgba(220, 38, 38, 0.12);
+    border: 1px solid rgba(220, 38, 38, 0.45);
+    border-radius: 14px;
+    padding: 20px;
+    margin-top: 15px;
+}
+
+.error-title {
+    color: #dc2626;
+    font-size: 1.2rem;
+    font-weight: 750;
+    margin-bottom: 10px;
+}
+
+.error-message {
+    font-size: 1rem;
+}
+"""
+
+
+# =========================================================
+# GRADIO GUI
+# =========================================================
+with gr.Blocks(
+    title="Axial Frequency Predictor",
+    css=CUSTOM_CSS,
+) as demo:
+
+    gr.Markdown(
+        """
+        # ⚙️ Axial Frequency Predictor
+
+        <div class="app-subtitle">
+        Predict axial frequency using a trained
+        ExtraTrees regression model.
+        Enter the fixed-material and free-material
+        properties below.
+        </div>
+        """
     )
+
+    if IMAGE_PATH.exists():
+        gr.Image(
+            value=str(IMAGE_PATH),
+            show_label=False,
+            interactive=False,
+        )
+
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("## Fixed Material")
+
+            e_fixed_input = gr.Number(
+                label="E (Fixed) [N/m²]",
+                value=1.97e11,
+            )
+
+            rho_fixed_input = gr.Number(
+                label="ρ (Fixed) [kg/m³]",
+                value=7750.3,
+            )
+
+            nu_fixed_input = gr.Number(
+                label="ν (Fixed) [-]",
+                value=0.29,
+            )
+
+        with gr.Column():
+            gr.Markdown("## Free Material")
+
+            e_free_input = gr.Number(
+                label="E (Free) [N/m²]",
+                value=4.24e8,
+            )
+
+            rho_free_input = gr.Number(
+                label="ρ (Free) [kg/m³]",
+                value=2200.5,
+            )
+
+            nu_free_input = gr.Number(
+                label="ν (Free) [-]",
+                value=0.45,
+            )
+
+    predict_button = gr.Button(
+        "Predict Axial Frequency",
+        variant="primary",
+    )
+
+    result_output = gr.HTML()
+
+    status_output = gr.Markdown()
+
+    with gr.Accordion(
+        "Training Validity Region",
+        open=False,
+    ):
+        validity_output = gr.Dataframe(
+            headers=[
+                "Feature",
+                "Current Value",
+                "Training Minimum",
+                "Training Maximum",
+                "Status",
+            ],
+            interactive=False,
+        )
+
+    if VIDEO_PATH.exists():
+        gr.Markdown("## Axial Deformation")
+
+        gr.Video(
+            value=str(VIDEO_PATH),
+            interactive=False,
+        )
+
+    predict_button.click(
+        fn=predict_axial_frequency,
+        inputs=[
+            e_fixed_input,
+            rho_fixed_input,
+            nu_fixed_input,
+            e_free_input,
+            rho_free_input,
+            nu_free_input,
+        ],
+        outputs=[
+            result_output,
+            status_output,
+            validity_output,
+        ],
+    )
+
+
+# =========================================================
+# START APPLICATION
+# =========================================================
+if __name__ == "__main__":
+    demo.launch()
