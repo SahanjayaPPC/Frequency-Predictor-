@@ -1,11 +1,12 @@
 from pathlib import Path
 import html
+import math
 
 import gradio as gr
 import joblib
 import matplotlib
 
-# Required for plotting on Hugging Face without a desktop display
+# Required for Hugging Face/headless environments
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -23,15 +24,22 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "ExtraTrees.pkl"
 DATA_PATH = BASE_DIR / "Raw_Data_Set.xlsx"
 
-IMAGE_PATH = BASE_DIR / "Steel and Aluminium.png"
+TOP_IMAGE_PATH = BASE_DIR / "Steel and Aluminium.png"
 VIDEO_PATH = BASE_DIR / "Axial Deformation.mp4"
 
 OUTPUT_DIR = BASE_DIR / "axial_frequency_outputs_xlsx"
 
 
 # =========================================================
-# MODEL FEATURES
-# These names must match the model training columns exactly.
+# MODEL INFORMATION
+# Value obtained from the completed 5-fold CV analysis
+# =========================================================
+PREDICTOR_R2 = 0.9970
+
+
+# =========================================================
+# MODEL INPUT FEATURES
+# These names must exactly match the training columns.
 # =========================================================
 FEATURE_COLS = [
     "E Fixed",
@@ -56,10 +64,10 @@ DISPLAY_NAMES = {
 
 
 # =========================================================
-# FILE HELPERS
+# BASIC HELPERS
 # =========================================================
 def first_existing_path(*candidates):
-    """Return the first existing file from the candidates."""
+    """Return the first existing path, otherwise None."""
     for candidate in candidates:
         path = Path(candidate)
 
@@ -69,16 +77,72 @@ def first_existing_path(*candidates):
     return None
 
 
+def format_scientific(value: float) -> str:
+    """Format a number using scientific notation."""
+    return f"{float(value):.6e}"
+
+
+def parse_scientific_value(
+    value,
+    field_name: str,
+) -> float:
+    """
+    Convert text into a floating-point value.
+
+    Accepted formats:
+        1.970000e+11
+        1.97E11
+        197000000000
+        7,750.3
+    """
+    if value is None:
+        raise ValueError(
+            f"{field_name} is required."
+        )
+
+    text = str(value).strip().replace(",", "")
+
+    if not text:
+        raise ValueError(
+            f"{field_name} is required."
+        )
+
+    try:
+        number = float(text)
+
+    except ValueError as error:
+        raise ValueError(
+            f"{field_name} must be a valid number. "
+            "Scientific notation such as 1.97e11 is accepted."
+        ) from error
+
+    if not math.isfinite(number):
+        raise ValueError(
+            f"{field_name} must be a finite number."
+        )
+
+    return number
+
+
 # =========================================================
 # COLUMN NORMALIZATION
 # =========================================================
-def simplify_name(name: str) -> str:
+def simplify_column_name(name: str) -> str:
+    """
+    Convert different Excel column formats into a
+    comparable simplified format.
+
+    Examples:
+        ρ Fixed -> rhofixed
+        ν Free  -> nufree
+        E_Free  -> efree
+    """
     text = str(name).strip().lower()
 
     text = text.replace("ρ", "rho")
     text = text.replace("ν", "nu")
 
-    for character in [
+    characters_to_remove = [
         " ",
         "_",
         "-",
@@ -91,13 +155,18 @@ def simplify_name(name: str) -> str:
         ".",
         "/",
         "\\",
-    ]:
+    ]
+
+    for character in characters_to_remove:
         text = text.replace(character, "")
 
     return text
 
 
-def normalize_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+def normalize_columns(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    """Rename dataset columns into canonical names."""
     dataframe = dataframe.copy()
 
     dataframe.columns = [
@@ -119,14 +188,18 @@ def normalize_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
     rename_dictionary = {}
 
     for original_column in dataframe.columns:
-        simplified_column = simplify_name(original_column)
+        simplified = simplify_column_name(
+            original_column
+        )
 
-        if simplified_column in canonical_names:
+        if simplified in canonical_names:
             rename_dictionary[original_column] = (
-                canonical_names[simplified_column]
+                canonical_names[simplified]
             )
 
-    return dataframe.rename(columns=rename_dictionary)
+    return dataframe.rename(
+        columns=rename_dictionary
+    )
 
 
 # =========================================================
@@ -159,8 +232,13 @@ try:
             f"Dataset was not found: {DATA_PATH.name}"
         )
 
-    reference_dataframe = pd.read_excel(DATA_PATH)
-    reference_dataframe = normalize_columns(reference_dataframe)
+    reference_dataframe = pd.read_excel(
+        DATA_PATH
+    )
+
+    reference_dataframe = normalize_columns(
+        reference_dataframe
+    )
 
     missing_columns = [
         column
@@ -195,93 +273,222 @@ try:
         .reset_index(drop=True)
     )
 
+    if REFERENCE_DATA.empty:
+        raise ValueError(
+            "No valid material-property rows were found "
+            "in Raw_Data_Set.xlsx."
+        )
+
 except Exception as error:
     DATA_ERROR = str(error)
 
 
 # =========================================================
-# CREATE INPUT DATAFRAME
+# CALCULATE VARIABLE BOUNDARIES
+# Boundaries are rebuilt automatically from the Excel file.
+# =========================================================
+def calculate_boundaries(
+    dataframe: pd.DataFrame,
+) -> dict:
+    if dataframe is None or dataframe.empty:
+        return {}
+
+    boundaries = {}
+
+    for feature in FEATURE_COLS:
+        values = pd.to_numeric(
+            dataframe[feature],
+            errors="coerce",
+        ).dropna()
+
+        if values.empty:
+            continue
+
+        boundaries[feature] = {
+            "minimum": float(values.min()),
+            "maximum": float(values.max()),
+            "median": float(values.median()),
+        }
+
+    return boundaries
+
+
+BOUNDARIES = calculate_boundaries(
+    REFERENCE_DATA
+)
+
+
+def create_boundary_table() -> pd.DataFrame:
+    rows = []
+
+    for feature in FEATURE_COLS:
+        boundary = BOUNDARIES.get(feature)
+
+        if boundary is None:
+            rows.append(
+                {
+                    "Variable": DISPLAY_NAMES[feature],
+                    "Training Minimum": "N/A",
+                    "Training Maximum": "N/A",
+                }
+            )
+
+        else:
+            rows.append(
+                {
+                    "Variable": DISPLAY_NAMES[feature],
+                    "Training Minimum": format_scientific(
+                        boundary["minimum"]
+                    ),
+                    "Training Maximum": format_scientific(
+                        boundary["maximum"]
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+BOUNDARY_TABLE = create_boundary_table()
+
+
+def range_information(feature: str) -> str:
+    boundary = BOUNDARIES.get(feature)
+
+    if boundary is None:
+        return "Training range unavailable"
+
+    return (
+        "Training range: "
+        f"{format_scientific(boundary['minimum'])} "
+        "to "
+        f"{format_scientific(boundary['maximum'])}"
+    )
+
+
+# =========================================================
+# DEFAULT VALUES
+# Preferred defaults are used only when they are inside
+# the current dataset boundaries.
+# =========================================================
+def safe_default(
+    feature: str,
+    preferred_value: float,
+) -> float:
+    boundary = BOUNDARIES.get(feature)
+
+    if boundary is None:
+        return float(preferred_value)
+
+    minimum = boundary["minimum"]
+    maximum = boundary["maximum"]
+
+    if minimum <= preferred_value <= maximum:
+        return float(preferred_value)
+
+    return float(boundary["median"])
+
+
+DEFAULT_VALUES = {
+    # Fixed material: steel
+    "E Fixed": safe_default(
+        "E Fixed",
+        1.970000e11,
+    ),
+    "rho Fixed": safe_default(
+        "rho Fixed",
+        7.750300e03,
+    ),
+    "nu Fixed": safe_default(
+        "nu Fixed",
+        2.900000e-01,
+    ),
+
+    # Free material: aluminium
+    "E Free": safe_default(
+        "E Free",
+        7.170000e10,
+    ),
+    "rho Free": safe_default(
+        "rho Free",
+        2.795700e03,
+    ),
+    "nu Free": safe_default(
+        "nu Free",
+        3.300000e-01,
+    ),
+}
+
+
+# =========================================================
+# CREATE MODEL INPUT DATAFRAME
 # =========================================================
 def create_input_dataframe(
-    e_fixed,
-    rho_fixed,
-    nu_fixed,
-    e_free,
-    rho_free,
-    nu_free,
+    e_fixed: float,
+    rho_fixed: float,
+    nu_fixed: float,
+    e_free: float,
+    rho_free: float,
+    nu_free: float,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
-                "E Fixed": float(e_fixed),
-                "rho Fixed": float(rho_fixed),
-                "nu Fixed": float(nu_fixed),
-                "E Free": float(e_free),
-                "rho Free": float(rho_free),
-                "nu Free": float(nu_free),
+                "E Fixed": e_fixed,
+                "rho Fixed": rho_fixed,
+                "nu Fixed": nu_fixed,
+                "E Free": e_free,
+                "rho Free": rho_free,
+                "nu Free": nu_free,
             }
         ]
     )
 
 
 # =========================================================
-# INPUT VALIDATION
+# PHYSICAL INPUT VALIDATION
 # =========================================================
-def validate_inputs(
-    e_fixed,
-    rho_fixed,
-    nu_fixed,
-    e_free,
-    rho_free,
-    nu_free,
+def validate_physical_inputs(
+    e_fixed: float,
+    rho_fixed: float,
+    nu_fixed: float,
+    e_free: float,
+    rho_free: float,
+    nu_free: float,
 ) -> None:
-    values = [
-        e_fixed,
-        rho_fixed,
-        nu_fixed,
-        e_free,
-        rho_free,
-        nu_free,
-    ]
-
-    if any(value is None for value in values):
-        raise ValueError(
-            "Please enter all six material properties."
-        )
-
-    if float(e_fixed) <= 0:
+    if e_fixed <= 0:
         raise ValueError(
             "E (Fixed) must be greater than zero."
         )
 
-    if float(rho_fixed) <= 0:
+    if rho_fixed <= 0:
         raise ValueError(
             "ρ (Fixed) must be greater than zero."
         )
 
-    if float(e_free) <= 0:
+    if e_free <= 0:
         raise ValueError(
             "E (Free) must be greater than zero."
         )
 
-    if float(rho_free) <= 0:
+    if rho_free <= 0:
         raise ValueError(
             "ρ (Free) must be greater than zero."
         )
 
-    if not 0 <= float(nu_fixed) < 0.5:
+    if not 0 <= nu_fixed < 0.5:
         raise ValueError(
             "ν (Fixed) must be between 0 and 0.5."
         )
 
-    if not 0 <= float(nu_free) < 0.5:
+    if not 0 <= nu_free < 0.5:
         raise ValueError(
             "ν (Free) must be between 0 and 0.5."
         )
 
 
 # =========================================================
-# TRAINING VALIDITY TABLE
+# TRAINING VALIDITY CHECK
 # =========================================================
 def build_validity_table(
     input_dataframe: pd.DataFrame,
@@ -289,64 +496,61 @@ def build_validity_table(
     rows = []
     outside_messages = []
 
-    if REFERENCE_DATA is None or REFERENCE_DATA.empty:
-        for feature in FEATURE_COLS:
-            current_value = float(
-                input_dataframe.iloc[0][feature]
-            )
-
-            rows.append(
-                {
-                    "Feature": DISPLAY_NAMES[feature],
-                    "Current Value": f"{current_value:.6e}",
-                    "Training Minimum": "N/A",
-                    "Training Maximum": "N/A",
-                    "Status": "Not checked",
-                }
-            )
-
-        return pd.DataFrame(rows), outside_messages
-
     for feature in FEATURE_COLS:
         current_value = float(
             input_dataframe.iloc[0][feature]
         )
 
-        reference_values = (
-            REFERENCE_DATA[feature]
-            .dropna()
-        )
+        boundary = BOUNDARIES.get(feature)
 
-        minimum_value = float(reference_values.min())
-        maximum_value = float(reference_values.max())
-
-        if current_value < minimum_value:
-            status = "Below range"
-
-            outside_messages.append(
-                f"**{DISPLAY_NAMES[feature]}** is below the "
-                f"training minimum: `{current_value:.6e}` "
-                f"< `{minimum_value:.6e}`."
-            )
-
-        elif current_value > maximum_value:
-            status = "Above range"
-
-            outside_messages.append(
-                f"**{DISPLAY_NAMES[feature]}** is above the "
-                f"training maximum: `{current_value:.6e}` "
-                f"> `{maximum_value:.6e}`."
-            )
+        if boundary is None:
+            minimum_display = "N/A"
+            maximum_display = "N/A"
+            status = "Not checked"
 
         else:
-            status = "Inside"
+            minimum_value = boundary["minimum"]
+            maximum_value = boundary["maximum"]
+
+            minimum_display = format_scientific(
+                minimum_value
+            )
+
+            maximum_display = format_scientific(
+                maximum_value
+            )
+
+            if current_value < minimum_value:
+                status = "Below range"
+
+                outside_messages.append(
+                    f"**{DISPLAY_NAMES[feature]}** is below "
+                    "the training minimum: "
+                    f"`{format_scientific(current_value)}` < "
+                    f"`{format_scientific(minimum_value)}`."
+                )
+
+            elif current_value > maximum_value:
+                status = "Above range"
+
+                outside_messages.append(
+                    f"**{DISPLAY_NAMES[feature]}** is above "
+                    "the training maximum: "
+                    f"`{format_scientific(current_value)}` > "
+                    f"`{format_scientific(maximum_value)}`."
+                )
+
+            else:
+                status = "Inside"
 
         rows.append(
             {
                 "Feature": DISPLAY_NAMES[feature],
-                "Current Value": f"{current_value:.6e}",
-                "Training Minimum": f"{minimum_value:.6e}",
-                "Training Maximum": f"{maximum_value:.6e}",
+                "Current Value": format_scientific(
+                    current_value
+                ),
+                "Training Minimum": minimum_display,
+                "Training Maximum": maximum_display,
                 "Status": status,
             }
         )
@@ -355,20 +559,19 @@ def build_validity_table(
 
 
 # =========================================================
-# CONTOUR MAP DATA
+# CONTOUR MAP CASES
 # =========================================================
 def build_single_material_cases(
     input_dataframe: pd.DataFrame,
 ):
     """
     Create:
-
-    1. Fixed material used at both ends
-    2. Free material used at both ends
+        1. Fixed material used at both positions
+        2. Free material used at both positions
     """
     row = input_dataframe.iloc[0]
 
-    fixed_fixed = pd.DataFrame(
+    fixed_fixed_case = pd.DataFrame(
         [
             {
                 "E Fixed": row["E Fixed"],
@@ -381,7 +584,7 @@ def build_single_material_cases(
         ]
     )
 
-    free_free = pd.DataFrame(
+    free_free_case = pd.DataFrame(
         [
             {
                 "E Fixed": row["E Free"],
@@ -394,28 +597,32 @@ def build_single_material_cases(
         ]
     )
 
-    return fixed_fixed, free_free
+    return fixed_fixed_case, free_free_case
 
 
+# =========================================================
+# BUILD CONTOUR BACKGROUND
+# =========================================================
 def build_contour_dataframe(
     reference_dataframe: pd.DataFrame,
     model,
 ) -> pd.DataFrame:
-    """
-    Create the background contour-map dataset.
+    if reference_dataframe is None:
+        raise ValueError(
+            "Reference dataset is unavailable."
+        )
 
-    x-axis:
-        Free material used at both ends
+    mixed_cases = (
+        reference_dataframe[FEATURE_COLS]
+        .dropna()
+        .copy()
+    )
 
-    y-axis:
-        Fixed material used at both ends
-
-    z-value:
-        Mixed-material prediction
-    """
-    mixed_cases = reference_dataframe[
-        FEATURE_COLS
-    ].copy()
+    if mixed_cases.empty:
+        raise ValueError(
+            "No complete rows are available for "
+            "the contour map."
+        )
 
     fixed_fixed_cases = pd.DataFrame(
         {
@@ -479,7 +686,6 @@ try:
     if (
         MODEL is not None
         and REFERENCE_DATA is not None
-        and not REFERENCE_DATA.empty
     ):
         CONTOUR_DATA = build_contour_dataframe(
             REFERENCE_DATA,
@@ -493,19 +699,21 @@ except Exception as error:
 def create_user_contour_coordinates(
     input_dataframe: pd.DataFrame,
 ):
-    fixed_fixed, free_free = (
-        build_single_material_cases(input_dataframe)
+    fixed_fixed_case, free_free_case = (
+        build_single_material_cases(
+            input_dataframe
+        )
     )
 
-    x_axis = float(
+    free_free_prediction = float(
         MODEL.predict(
-            free_free[FEATURE_COLS]
+            free_free_case[FEATURE_COLS]
         )[0]
     )
 
-    y_axis = float(
+    fixed_fixed_prediction = float(
         MODEL.predict(
-            fixed_fixed[FEATURE_COLS]
+            fixed_fixed_case[FEATURE_COLS]
         )[0]
     )
 
@@ -515,9 +723,16 @@ def create_user_contour_coordinates(
         )[0]
     )
 
-    return x_axis, y_axis, mixed_prediction
+    return (
+        free_free_prediction,
+        fixed_fixed_prediction,
+        mixed_prediction,
+    )
 
 
+# =========================================================
+# CREATE CONTOUR FIGURE
+# =========================================================
 def create_contour_plot(
     contour_dataframe: pd.DataFrame,
     x_user: float,
@@ -529,10 +744,10 @@ def create_contour_plot(
         or len(contour_dataframe) < 3
     ):
         raise ValueError(
-            "Not enough contour-map points are available."
+            "Not enough unique contour points are available."
         )
 
-    fig, ax = plt.subplots(
+    figure, axis = plt.subplots(
         figsize=(9, 7)
     )
 
@@ -554,89 +769,92 @@ def create_contour_plot(
             y_values,
         )
 
-        contour = ax.tricontourf(
+        contour = axis.tricontourf(
             triangulation,
             z_values,
             levels=20,
         )
 
     except Exception:
-        # Fallback if the points cannot be triangulated
-        contour = ax.scatter(
+        contour = axis.scatter(
             x_values,
             y_values,
             c=z_values,
             s=45,
         )
 
-    colorbar = fig.colorbar(
+    colorbar = figure.colorbar(
         contour,
-        ax=ax,
+        ax=axis,
     )
 
     colorbar.set_label(
-        r"Predicted $f_{\mathrm{axial}}$ (Hz)"
+        "Predicted axial frequency (Hz)"
     )
 
-    x_min = min(
+    x_minimum = min(
         float(np.min(x_values)),
         x_user,
     )
 
-    x_max = max(
+    x_maximum = max(
         float(np.max(x_values)),
         x_user,
     )
 
-    y_min = min(
+    y_minimum = min(
         float(np.min(y_values)),
         y_user,
     )
 
-    y_max = max(
+    y_maximum = max(
         float(np.max(y_values)),
         y_user,
     )
 
     x_padding = 0.05 * (
-        x_max - x_min
-        if x_max > x_min
+        x_maximum - x_minimum
+        if x_maximum > x_minimum
         else 1.0
     )
 
     y_padding = 0.05 * (
-        y_max - y_min
-        if y_max > y_min
+        y_maximum - y_minimum
+        if y_maximum > y_minimum
         else 1.0
     )
 
-    x_lower = x_min - x_padding
-    x_upper = x_max + x_padding
+    x_lower = x_minimum - x_padding
+    x_upper = x_maximum + x_padding
 
-    y_lower = y_min - y_padding
-    y_upper = y_max + y_padding
+    y_lower = y_minimum - y_padding
+    y_upper = y_maximum + y_padding
 
-    ax.set_xlim(x_lower, x_upper)
-    ax.set_ylim(y_lower, y_upper)
+    axis.set_xlim(
+        x_lower,
+        x_upper,
+    )
 
-    # Free/free prediction line
-    ax.axvline(
+    axis.set_ylim(
+        y_lower,
+        y_upper,
+    )
+
+    axis.axvline(
         x_user,
         linestyle="--",
         linewidth=1.8,
         label="Free material – Free material",
     )
 
-    # Fixed/fixed prediction line
-    ax.axhline(
+    axis.axhline(
         y_user,
         linestyle="--",
         linewidth=1.8,
         label="Fixed material – Fixed material",
     )
 
-    # Free/free marker
-    ax.scatter(
+    axis.scatter(
         [x_user],
         [y_lower],
         s=90,
@@ -644,7 +862,7 @@ def create_contour_plot(
         zorder=6,
     )
 
-    ax.annotate(
+    axis.annotate(
         f"Free – Free\n{x_user:.2f} Hz",
         (x_user, y_lower),
         textcoords="offset points",
@@ -653,12 +871,11 @@ def create_contour_plot(
         bbox={
             "boxstyle": "round,pad=0.25",
             "facecolor": "white",
-            "alpha": 0.80,
+            "alpha": 0.82,
         },
     )
 
-    # Fixed/fixed marker
-    ax.scatter(
+    axis.scatter(
         [x_lower],
         [y_user],
         s=90,
@@ -666,7 +883,7 @@ def create_contour_plot(
         zorder=6,
     )
 
-    ax.annotate(
+    axis.annotate(
         f"Fixed – Fixed\n{y_user:.2f} Hz",
         (x_lower, y_user),
         textcoords="offset points",
@@ -675,12 +892,11 @@ def create_contour_plot(
         bbox={
             "boxstyle": "round,pad=0.25",
             "facecolor": "white",
-            "alpha": 0.80,
+            "alpha": 0.82,
         },
     )
 
-    # Mixed-material intersection
-    ax.scatter(
+    axis.scatter(
         [x_user],
         [y_user],
         s=170,
@@ -691,14 +907,14 @@ def create_contour_plot(
         label="Mixed-material intersection",
     )
 
-    ax.scatter(
+    axis.scatter(
         [x_user],
         [y_user],
         s=35,
         zorder=8,
     )
 
-    ax.annotate(
+    axis.annotate(
         f"Mixed material\n{z_user:.2f} Hz",
         (x_user, y_user),
         textcoords="offset points",
@@ -707,40 +923,40 @@ def create_contour_plot(
         bbox={
             "boxstyle": "round,pad=0.25",
             "facecolor": "white",
-            "alpha": 0.80,
+            "alpha": 0.82,
         },
     )
 
-    ax.set_xlabel(
-        "Free material – Free material "
-        "predicted axial frequency (Hz)"
+    axis.set_xlabel(
+        "Free material – Free material predicted "
+        "axial frequency (Hz)"
     )
 
-    ax.set_ylabel(
-        "Fixed material – Fixed material "
-        "predicted axial frequency (Hz)"
+    axis.set_ylabel(
+        "Fixed material – Fixed material predicted "
+        "axial frequency (Hz)"
     )
 
-    ax.set_title(
+    axis.set_title(
         "Contour Map of Predicted Axial Frequency"
     )
 
-    ax.grid(
+    axis.grid(
         True,
         alpha=0.30,
     )
 
-    ax.legend(
+    axis.legend(
         loc="best"
     )
 
-    fig.tight_layout()
+    figure.tight_layout()
 
-    return fig
+    return figure
 
 
 # =========================================================
-# OUTPUT IMAGE GALLERY
+# MODEL OUTPUT IMAGE GALLERY
 # =========================================================
 OUTPUT_IMAGE_DEFINITIONS = [
     (
@@ -765,13 +981,13 @@ OUTPUT_IMAGE_DEFINITIONS = [
     ),
     (
         "gam_partial_effect_plots.png",
-        "GAM Partial Effects",
+        "GAM Partial-Effect Plots",
     ),
 ]
 
 
 def collect_output_images():
-    gallery_images = []
+    images = []
 
     for filename, caption in OUTPUT_IMAGE_DEFINITIONS:
         image_path = first_existing_path(
@@ -780,21 +996,21 @@ def collect_output_images():
         )
 
         if image_path is not None:
-            gallery_images.append(
+            images.append(
                 (
                     str(image_path),
                     caption,
                 )
             )
 
-    return gallery_images
+    return images
 
 
 OUTPUT_IMAGES = collect_output_images()
 
 
 # =========================================================
-# RESULT CARDS
+# HTML RESULT CARDS
 # =========================================================
 def build_prediction_card(
     prediction: float,
@@ -802,7 +1018,7 @@ def build_prediction_card(
     return f"""
     <div class="prediction-card">
         <div class="prediction-title">
-            Predicted Axial Frequency
+            ExtraTrees Predictor
         </div>
 
         <div class="prediction-number">
@@ -811,49 +1027,67 @@ def build_prediction_card(
                 Hz
             </span>
         </div>
+    </div>
+    """
 
-        <div class="prediction-model">
-            Model: ExtraTrees Regressor
+
+def build_r2_card() -> str:
+    return f"""
+    <div class="metric-card-row">
+
+        <div class="metric-card">
+            <div class="metric-title">
+                Predictor R²
+            </div>
+
+            <div class="metric-value">
+                {PREDICTOR_R2:.4f}
+            </div>
+
+            <div class="metric-caption">
+                Mean R² from 5-fold cross-validation
+            </div>
         </div>
+
     </div>
     """
 
 
 def build_contour_value_cards(
-    x_user: float,
-    y_user: float,
-    z_user: float,
+    free_free: float,
+    fixed_fixed: float,
+    mixed: float,
 ) -> str:
     return f"""
     <div class="three-card-row">
 
-        <div class="info-card">
-            <div class="info-title">
+        <div class="information-card">
+            <div class="information-title">
                 Free Material – Free Material
             </div>
 
-            <div class="info-value">
-                {x_user:,.2f} Hz
+            <div class="information-value">
+                {free_free:,.2f} Hz
             </div>
         </div>
 
-        <div class="info-card">
-            <div class="info-title">
+        <div class="information-card">
+            <div class="information-title">
                 Fixed Material – Fixed Material
             </div>
 
-            <div class="info-value">
-                {y_user:,.2f} Hz
+            <div class="information-value">
+                {fixed_fixed:,.2f} Hz
             </div>
         </div>
 
-        <div class="info-card">
-            <div class="info-title">
+        <div class="information-card">
+            <div class="information-title">
                 Mixed-Material Frequency
             </div>
 
-            <div class="info-value">
-                {z_user:,.2f} Hz
+            <div class="information-value">
+                {mixed:,.2f} Hz
             </div>
         </div>
 
@@ -862,17 +1096,19 @@ def build_contour_value_cards(
 
 
 # =========================================================
-# PREDICTION FUNCTION
-# ZeroGPU requires a @spaces.GPU decorated function.
+# MAIN PREDICTION FUNCTION
+#
+# ZeroGPU requires at least one @spaces.GPU function.
+# The ExtraTrees prediction itself is CPU-based.
 # =========================================================
 @spaces.GPU(duration=10)
 def predict_axial_frequency(
-    e_fixed,
-    rho_fixed,
-    nu_fixed,
-    e_free,
-    rho_free,
-    nu_free,
+    e_fixed_text,
+    rho_fixed_text,
+    nu_fixed_text,
+    e_free_text,
+    rho_free_text,
+    nu_free_text,
 ):
     try:
         if MODEL is None:
@@ -881,7 +1117,37 @@ def predict_axial_frequency(
                 f"Details: {MODEL_ERROR}"
             )
 
-        validate_inputs(
+        e_fixed = parse_scientific_value(
+            e_fixed_text,
+            "E (Fixed)",
+        )
+
+        rho_fixed = parse_scientific_value(
+            rho_fixed_text,
+            "ρ (Fixed)",
+        )
+
+        nu_fixed = parse_scientific_value(
+            nu_fixed_text,
+            "ν (Fixed)",
+        )
+
+        e_free = parse_scientific_value(
+            e_free_text,
+            "E (Free)",
+        )
+
+        rho_free = parse_scientific_value(
+            rho_free_text,
+            "ρ (Free)",
+        )
+
+        nu_free = parse_scientific_value(
+            nu_free_text,
+            "ν (Free)",
+        )
+
+        validate_physical_inputs(
             e_fixed,
             rho_fixed,
             nu_fixed,
@@ -906,65 +1172,66 @@ def predict_axial_frequency(
         )
 
         validity_table, outside_messages = (
-            build_validity_table(input_dataframe)
+            build_validity_table(
+                input_dataframe
+            )
         )
 
         if outside_messages:
-            bullet_list = "\n".join(
+            message_list = "\n".join(
                 f"- {message}"
                 for message in outside_messages
             )
 
             status_message = (
-                "⚠️ **Some values are outside the "
-                "model-training range:**\n\n"
-                f"{bullet_list}\n\n"
-                "The model can still return a result, but "
+                "⚠️ **Input values outside the training "
+                "region:**\n\n"
+                f"{message_list}\n\n"
+                "The model can still produce a result, but "
                 "the prediction may be less reliable."
             )
 
         elif REFERENCE_DATA is None:
             status_message = (
                 "ℹ️ Prediction completed, but the training "
-                "range could not be checked. "
-                f"Dataset details: {DATA_ERROR}"
+                "ranges could not be checked. "
+                f"Dataset error: {DATA_ERROR}"
             )
 
         else:
             status_message = (
-                "✅ All six input values are inside their "
-                "training-data ranges."
+                "✅ All six values are inside the "
+                "current dataset training ranges."
             )
 
-        x_user = None
-        y_user = None
-        z_user = prediction
         contour_figure = None
         contour_cards = ""
 
         if CONTOUR_DATA is not None:
-            x_user, y_user, z_user = (
-                create_user_contour_coordinates(
-                    input_dataframe
-                )
+            (
+                free_free_prediction,
+                fixed_fixed_prediction,
+                mixed_prediction,
+            ) = create_user_contour_coordinates(
+                input_dataframe
             )
 
             contour_figure = create_contour_plot(
                 CONTOUR_DATA,
-                x_user,
-                y_user,
-                z_user,
+                free_free_prediction,
+                fixed_fixed_prediction,
+                mixed_prediction,
             )
 
             contour_cards = build_contour_value_cards(
-                x_user,
-                y_user,
-                z_user,
+                free_free_prediction,
+                fixed_fixed_prediction,
+                mixed_prediction,
             )
 
         elif CONTOUR_ERROR:
             status_message += (
-                "\n\nContour map could not be generated: "
+                "\n\nContour-map error: "
                 f"`{CONTOUR_ERROR}`"
             )
 
@@ -1012,7 +1279,8 @@ def predict_axial_frequency(
 
         return (
             error_html,
-            "Please correct the inputs or inspect the Space logs.",
+            "Please correct the input values or inspect "
+            "the Space logs.",
             empty_table,
             None,
             "",
@@ -1033,6 +1301,12 @@ CUSTOM_CSS = """
     color: #9ca3af;
     font-size: 1.05rem;
     margin-bottom: 1.3rem;
+}
+
+.scientific-input input {
+    font-family: "Courier New", monospace !important;
+    font-size: 1.05rem !important;
+    letter-spacing: 0.02rem !important;
 }
 
 .prediction-card {
@@ -1068,10 +1342,39 @@ CUSTOM_CSS = """
     font-weight: 650;
 }
 
-.prediction-model {
-    color: #d9fbe5;
-    margin-top: 14px;
-    font-size: 0.95rem;
+.metric-card-row {
+    display: grid;
+    grid-template-columns: minmax(280px, 460px);
+    gap: 20px;
+    margin-top: 12px;
+    margin-bottom: 22px;
+}
+
+.metric-card {
+    background: #0d1d2a;
+    border: 1px solid #1e6a9e;
+    border-radius: 18px;
+    padding: 24px 28px;
+    min-height: 125px;
+}
+
+.metric-title {
+    color: #ffffff;
+    font-size: 1.12rem;
+    font-weight: 750;
+    margin-bottom: 14px;
+}
+
+.metric-value {
+    color: #ffffff;
+    font-size: 1.55rem;
+    font-weight: 800;
+}
+
+.metric-caption {
+    color: #9ca3af;
+    font-size: 0.88rem;
+    margin-top: 8px;
 }
 
 .three-card-row {
@@ -1082,21 +1385,21 @@ CUSTOM_CSS = """
     margin-bottom: 18px;
 }
 
-.info-card {
+.information-card {
     background: rgba(33, 150, 243, 0.13);
     border: 1px solid rgba(33, 150, 243, 0.35);
     border-radius: 14px;
     padding: 18px;
 }
 
-.info-title {
+.information-title {
     color: #9fd0ff;
     font-size: 0.95rem;
     font-weight: 650;
     margin-bottom: 10px;
 }
 
-.info-value {
+.information-value {
     color: white;
     font-size: 1.25rem;
     font-weight: 750;
@@ -1122,6 +1425,10 @@ CUSTOM_CSS = """
 }
 
 @media (max-width: 850px) {
+    .metric-card-row {
+        grid-template-columns: 1fr;
+    }
+
     .three-card-row {
         grid-template-columns: 1fr;
     }
@@ -1141,16 +1448,27 @@ with gr.Blocks(
         # ⚙️ Axial Frequency Predictor
 
         <div class="app-subtitle">
-        Predict axial frequency using the trained
-        ExtraTrees regression model.
+        Enter the material properties using scientific notation,
+        for example <strong>1.970000e+11</strong>.
+        The training ranges are calculated automatically from
+        Raw_Data_Set.xlsx.
         </div>
         """
     )
 
-    if IMAGE_PATH.exists():
+    if TOP_IMAGE_PATH.exists():
         gr.Image(
-            value=str(IMAGE_PATH),
+            value=str(TOP_IMAGE_PATH),
             show_label=False,
+            interactive=False,
+        )
+
+    with gr.Accordion(
+        "Current Dataset Boundaries",
+        open=False,
+    ):
+        gr.Dataframe(
+            value=BOUNDARY_TABLE,
             interactive=False,
         )
 
@@ -1158,37 +1476,67 @@ with gr.Blocks(
         with gr.Column():
             gr.Markdown("## Fixed Material")
 
-            e_fixed_input = gr.Number(
+            e_fixed_input = gr.Textbox(
                 label="E (Fixed) [N/m²]",
-                value=1.97e11,
+                value=format_scientific(
+                    DEFAULT_VALUES["E Fixed"]
+                ),
+                placeholder="Example: 1.970000e+11",
+                info=range_information("E Fixed"),
+                elem_classes=["scientific-input"],
             )
 
-            rho_fixed_input = gr.Number(
+            rho_fixed_input = gr.Textbox(
                 label="ρ (Fixed) [kg/m³]",
-                value=7750.3,
+                value=format_scientific(
+                    DEFAULT_VALUES["rho Fixed"]
+                ),
+                placeholder="Example: 7.750300e+03",
+                info=range_information("rho Fixed"),
+                elem_classes=["scientific-input"],
             )
 
-            nu_fixed_input = gr.Number(
+            nu_fixed_input = gr.Textbox(
                 label="ν (Fixed) [-]",
-                value=0.29,
+                value=format_scientific(
+                    DEFAULT_VALUES["nu Fixed"]
+                ),
+                placeholder="Example: 2.900000e-01",
+                info=range_information("nu Fixed"),
+                elem_classes=["scientific-input"],
             )
 
         with gr.Column():
             gr.Markdown("## Free Material")
 
-            e_free_input = gr.Number(
+            e_free_input = gr.Textbox(
                 label="E (Free) [N/m²]",
-                value=4.24e8,
+                value=format_scientific(
+                    DEFAULT_VALUES["E Free"]
+                ),
+                placeholder="Example: 7.170000e+10",
+                info=range_information("E Free"),
+                elem_classes=["scientific-input"],
             )
 
-            rho_free_input = gr.Number(
+            rho_free_input = gr.Textbox(
                 label="ρ (Free) [kg/m³]",
-                value=2200.5,
+                value=format_scientific(
+                    DEFAULT_VALUES["rho Free"]
+                ),
+                placeholder="Example: 2.795700e+03",
+                info=range_information("rho Free"),
+                elem_classes=["scientific-input"],
             )
 
-            nu_free_input = gr.Number(
+            nu_free_input = gr.Textbox(
                 label="ν (Free) [-]",
-                value=0.45,
+                value=format_scientific(
+                    DEFAULT_VALUES["nu Free"]
+                ),
+                placeholder="Example: 3.300000e-01",
+                info=range_information("nu Free"),
+                elem_classes=["scientific-input"],
             )
 
     predict_button = gr.Button(
@@ -1197,6 +1545,11 @@ with gr.Blocks(
     )
 
     result_output = gr.HTML()
+
+    # Fixed model-performance value from completed analysis
+    gr.HTML(
+        value=build_r2_card()
+    )
 
     status_output = gr.Markdown()
 
@@ -1223,14 +1576,13 @@ with gr.Blocks(
           is used for both material positions.
         - **y-axis:** predicted frequency when the fixed material
           is used for both material positions.
-        - **intersection:** current mixed-material ExtraTrees
-          prediction.
+        - **intersection:** the current mixed-material
+          ExtraTrees prediction.
         """
     )
 
     contour_output = gr.Plot(
         label="ExtraTrees Frequency Contour",
-        format="png",
     )
 
     contour_values_output = gr.HTML()
@@ -1261,7 +1613,7 @@ with gr.Blocks(
                 label="Model Output Images",
                 columns=2,
                 rows=3,
-                height="1000px",
+                height=1000,
                 object_fit="contain",
                 allow_preview=True,
             )
@@ -1289,7 +1641,7 @@ with gr.Blocks(
 
 
 # =========================================================
-# START APP
+# START APPLICATION
 # =========================================================
 if __name__ == "__main__":
     demo.queue(
